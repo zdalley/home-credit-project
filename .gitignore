@@ -1,0 +1,22 @@
+# Original data files; retain locally but never commit them.
+data/raw/
+
+# Generated data sets; keep only the directory placeholders in version control.
+data/interim/*
+!data/interim/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Serialized models and generated model artifacts; keep only the placeholder.
+models/*
+!models/.gitkeep
+*.pkl
+*.pickle
+*.joblib
+*.h5
+
+# Notebook/runtime and operating-system artifacts.
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+.DS_Store
