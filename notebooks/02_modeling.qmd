@@ -1,0 +1,750 @@
+---
+title: "Home Credit: TARGET Modeling Experiments"
+subtitle: "Leakage-safe model comparison and test scoring"
+author: "MSBA Practice Capstone"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: false
+execute:
+  echo: true
+  warning: false
+  freeze: auto
+jupyter: python3
+---
+
+## Purpose and workflow
+
+This notebook develops probability models for `TARGET` and compares them with
+ROC-AUC.  It is deliberately staged: inspect the output at each **approval
+checkpoint** before enabling the next section in the configuration cell.
+
+The unseen application test file has no `TARGET`, so its true AUC cannot be
+measured here.  We use an untouched development holdout and cross-validation
+as estimates of generalization, then create test probabilities only after a
+candidate is approved.
+
+The reusable application pipeline in `src/application_preparation.py` owns
+cleaning and engineered features.  It is fitted inside each training fold,
+not once on all data, so validation rows cannot influence medians, category
+support, or quantile-bin edges.
+
+```{python}
+#| label: imports-and-configuration
+#| message: false
+from __future__ import annotations
+
+import platform
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import sklearn
+from joblib import dump
+from scipy.stats import loguniform, randint
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer, make_column_selector
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import RocCurveDisplay, roc_auc_score
+from sklearn.model_selection import (
+    RandomizedSearchCV,
+    StratifiedKFold,
+    train_test_split,
+    cross_validate,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+
+def find_project_root(start: Path) -> Path:
+    """Find the repository root whether Quarto runs from root or notebooks/."""
+    for candidate in (start, *start.parents):
+        if (candidate / "src" / "application_preparation.py").exists():
+            return candidate
+    raise FileNotFoundError("Could not find src/application_preparation.py")
+
+
+PROJECT_ROOT = find_project_root(Path.cwd().resolve())
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.application_preparation import (  # noqa: E402
+    ID_COLUMN,
+    TARGET_COLUMN,
+    fit_application_preparation,
+    transform_application,
+    validate_prepared_outputs,
+)
+
+# Reproducibility: change the seed only when deliberately starting a new run.
+RANDOM_SEED = 20261009
+HOLDOUT_FRACTION = 0.20
+
+# Runtime controls.  Start fast, then use all data and 5 folds only for finalists.
+FAST_MODE = True
+EXPLORATION_SAMPLE_ROWS = 100_000
+TUNING_SAMPLE_ROWS = 5_000
+FAST_CV_FOLDS = 3
+FINAL_CV_FOLDS = 5
+SEARCH_ITERATIONS = 25
+
+# Histogram gradient boosting already uses native parallelism.  Keep search/CV
+# outer parallelism at one to avoid running several multi-threaded fits at once.
+SEARCH_N_JOBS = 1
+
+# Approval switches: set the next switch to True only after reviewing the
+# preceding output.  This makes long-running sections opt-in by default.
+RUN_EXPLORATION_CV = False
+RUN_RANDOM_SEARCH = False
+RUN_FINAL_CV = False
+RUN_TEST_SCORING = False
+
+# Set after reviewing the cross-validated comparison. The default is a starting
+# hypothesis, not a claim that gradient boosting has already won.
+SELECTED_MODEL_FAMILY = "hist_gradient_boosting"
+
+TRAIN_PATH = PROJECT_ROOT / "data/raw/application_train.csv"
+TEST_PATH = PROJECT_ROOT / "data/raw/application_test.csv"
+MODEL_PATH = PROJECT_ROOT / "models/home_credit_final_pipeline.joblib"
+SUBMISSION_PATH = PROJECT_ROOT / "data/processed/home_credit_test_predictions.csv"
+
+print(f"Project root: {PROJECT_ROOT}")
+print(f"Python: {sys.version.split()[0]} | pandas: {pd.__version__} | scikit-learn: {sklearn.__version__}")
+print(f"Platform: {platform.platform()}")
+```
+
+## 1. Load data and verify the application grain
+
+```{python}
+#| label: load-raw-data
+train_raw = pd.read_csv(TRAIN_PATH)
+test_raw = pd.read_csv(TEST_PATH)
+
+raw_audit = pd.DataFrame(
+    {
+        "rows": [len(train_raw), len(test_raw)],
+        "columns": [train_raw.shape[1], test_raw.shape[1]],
+        "unique_SK_ID_CURR": [train_raw[ID_COLUMN].nunique(), test_raw[ID_COLUMN].nunique()],
+        "target_rate": [train_raw[TARGET_COLUMN].mean(), np.nan],
+    },
+    index=["train", "test"],
+)
+display(raw_audit)
+
+assert train_raw[ID_COLUMN].is_unique and test_raw[ID_COLUMN].is_unique
+assert set(train_raw[ID_COLUMN]).isdisjoint(set(test_raw[ID_COLUMN]))
+assert set(train_raw[TARGET_COLUMN].unique()).issubset({0, 1})
+```
+
+**Interpretation.** The target rate sets the class-imbalance context; ROC-AUC
+is insensitive to its prevalence, but calibration and decision thresholds are
+not. `SK_ID_CURR` verifies row alignment and is never a predictor.
+
+**Approval checkpoint 1:** confirm row counts, key uniqueness, and target rate
+before continuing.
+
+## 2. Define feature-governance experiments
+
+`all_engineered` is the performance-oriented reference.  The other sets are
+ablations, not statements that any feature family is approved for lending use.
+The exclusions implement the cautions already recorded in the feature report:
+age/demographic and regional/address/housing groups should be reviewed before
+operational use; opaque external scores need provenance review.
+
+```{python}
+#| label: feature-set-rules
+FEATURE_SET_LABELS = {
+    "all_engineered": "All features emitted by the preparation pipeline.",
+    "no_external_scores": "Remove EXT_SOURCE fields and derived external-score summaries/bins.",
+    "governed_candidate": "Remove demographic and geographic/address/housing proxy-risk groups.",
+}
+
+
+def feature_columns_for_set(columns: pd.Index, feature_set: str) -> list[str]:
+    """Choose deterministic column subsets after fitted application preparation."""
+    names = list(columns)
+    if feature_set == "all_engineered":
+        return names
+
+    external_tokens = ("EXT_SOURCE", "external_score")
+    if feature_set == "no_external_scores":
+        return [name for name in names if not any(token in name for token in external_tokens)]
+
+    if feature_set == "governed_candidate":
+        # These patterns are intentionally conservative.  Review this list with
+        # the governance register rather than treating it as legal advice.
+        review_tokens = (
+            "CODE_GENDER", "NAME_FAMILY_STATUS", "DAYS_BIRTH", "age_years",
+            "REGION_", "REG_", "LIVE_", "address_mismatch",
+            "APARTMENTS_", "BASEMENTAREA_", "YEARS_", "COMMONAREA_",
+            "ELEVATORS_", "ENTRANCES_", "FLOORS", "LANDAREA_", "LIVING",
+            "NONLIVING", "FONDKAPREMONT", "HOUSETYPE", "WALLSMATERIAL",
+            "EMERGENCYSTATE", "TOTALAREA", "NAME_HOUSING_TYPE",
+        )
+        return [name for name in names if not any(token in name for token in review_tokens)]
+
+    raise ValueError(f"Unknown feature set: {feature_set}")
+```
+
+```{python}
+#| label: feature-set-audit
+# This audit fits on all labelled rows only to describe the candidate schema.
+# It is not used to estimate AUC; later pipelines refit inside each fold.
+schema_state = fit_application_preparation(train_raw)
+schema_features = transform_application(train_raw.head(1), schema_state)
+
+feature_audit = pd.DataFrame(
+    [
+        {
+            "feature_set": name,
+            "features": len(feature_columns_for_set(schema_features.columns, name)),
+            "description": description,
+        }
+        for name, description in FEATURE_SET_LABELS.items()
+    ]
+)
+display(feature_audit)
+```
+
+**Interpretation.** A meaningful AUC change after removing a family indicates
+predictive contribution, not suitability for use.  Keep the feature decision
+register as the source of approval, especially for demographic, geographic,
+address, housing, and external-score variables.
+
+**Approval checkpoint 2:** review the feature-set definitions and exclusions.
+
+## 3. Leakage-safe estimators and split
+
+The custom transformer below lets scikit-learn call the project preparation
+module during each `fit`.  `fit` receives only that training fold and learns a
+new preparation state; `transform` applies the saved state unchanged to the
+validation fold.  The target is attached temporarily only because the project
+module validates labelled training inputs; it is not used to compute features.
+
+```{python}
+#| label: leakage-safe-pipeline
+class ApplicationPreparer(BaseEstimator, TransformerMixin):
+    """scikit-learn adapter around the repository's fitted feature pipeline."""
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        training_frame = X.copy()
+        training_frame[TARGET_COLUMN] = np.asarray(y)
+        self.state_ = fit_application_preparation(training_frame)
+        self.feature_names_out_ = self.state_.output_feature_columns
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        return transform_application(X.copy(), self.state_)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.feature_names_out_, dtype=object)
+
+
+class FeatureSetSelector(BaseEstimator, TransformerMixin):
+    """Select an approved experiment feature set without learning from labels."""
+
+    def __init__(self, feature_set: str = "all_engineered"):
+        self.feature_set = feature_set
+
+    def fit(self, X: pd.DataFrame, y=None):
+        self.columns_ = feature_columns_for_set(X.columns, self.feature_set)
+        if not self.columns_:
+            raise ValueError(f"Feature set {self.feature_set!r} selected no columns.")
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        return X.loc[:, self.columns_].copy()
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.columns_, dtype=object)
+
+
+X_raw = train_raw.drop(columns=TARGET_COLUMN)
+y = train_raw[TARGET_COLUMN].astype("int8")
+
+X_dev, X_holdout, y_dev, y_holdout = train_test_split(
+    X_raw,
+    y,
+    test_size=HOLDOUT_FRACTION,
+    random_state=RANDOM_SEED,
+    stratify=y,
+)
+
+split_audit = pd.DataFrame(
+    {
+        "rows": [len(X_dev), len(X_holdout)],
+        "target_rate": [y_dev.mean(), y_holdout.mean()],
+    },
+    index=["development", "untouched_holdout"],
+)
+display(split_audit)
+
+# Directly inspect the pipeline once.  This is a schema/invariant test, not CV.
+inspection_preparer = ApplicationPreparer().fit(X_dev, y_dev)
+X_dev_prepared = inspection_preparer.transform(X_dev)
+X_holdout_prepared = inspection_preparer.transform(X_holdout)
+assert X_dev_prepared.columns.equals(X_holdout_prepared.columns)
+assert not X_dev_prepared.isna().any().any()
+assert not X_holdout_prepared.isna().any().any()
+display(pd.DataFrame({"prepared_features": [X_dev_prepared.shape[1]], "null_values": [int(X_dev_prepared.isna().sum().sum())]}))
+```
+
+**Interpretation.** The holdout is never used for parameter selection or
+random-search ranking.  It remains a single final sanity check after choosing
+a candidate with development cross-validation.
+
+**Approval checkpoint 3:** inspect feature count and zero-null/schema checks.
+
+### Supplementary-data availability (optional experiment)
+
+The assignment allows supplementary bureau, previous-application, installment,
+POS-CASH, and credit-card aggregates. They are not present in this repository
+snapshot, so the application-only comparison is the reproducible baseline.
+Do not join one-to-many raw child tables directly: first aggregate each to one
+timing-audited row per `SK_ID_CURR`, then use
+`join_aggregated_supplementary()` from the project pipeline. When those files
+are available, add a `supplementary_engineered` feature set and compare its
+three-fold AUC against `all_engineered` using the same folds.
+
+```{python}
+#| label: supplementary-data-inventory
+supplementary_sources = [
+    "bureau.csv", "previous_application.csv", "installments_payments.csv",
+    "POS_CASH_balance.csv", "credit_card_balance.csv",
+]
+supplementary_inventory = pd.DataFrame(
+    {
+        "source": supplementary_sources,
+        "available_in_data_raw": [(PROJECT_ROOT / "data/raw" / name).exists() for name in supplementary_sources],
+    }
+)
+display(supplementary_inventory)
+```
+
+## 4. Model definitions and holdout evaluator
+
+We establish the required majority-class benchmark with `DummyClassifier`.
+Its accuracy will be close to the non-default rate, but its AUC is exactly 0.5
+because it assigns every application the same score. This is why AUC—not
+accuracy—is the selection metric for this imbalanced outcome.
+
+Candidate models include logistic regression with two predictor sets, a random
+forest, and histogram gradient boosting. The unweighted and `class_weight=
+"balanced"` logistic models are the explicit no-adjustment/adjustment
+experiment. Class weighting retains all scarce positive cases and is much less
+memory-intensive than duplicating rows with upsampling or SMOTE. The tree
+models use ordinal encoding; trees split values rather than interpreting their
+integer category codes as a linear relationship.
+
+```{python}
+#| label: model-definitions
+def one_hot_preprocessor() -> ColumnTransformer:
+    return ColumnTransformer(
+        transformers=[
+            ("numeric", StandardScaler(), make_column_selector(dtype_include=np.number)),
+            ("categorical", OneHotEncoder(handle_unknown="ignore", min_frequency=25), make_column_selector(dtype_exclude=np.number)),
+        ],
+        remainder="drop",
+    )
+
+
+def ordinal_preprocessor() -> ColumnTransformer:
+    return ColumnTransformer(
+        transformers=[
+            ("numeric", "passthrough", make_column_selector(dtype_include=np.number)),
+            (
+                "categorical",
+                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
+                make_column_selector(dtype_exclude=np.number),
+            ),
+        ],
+        remainder="drop",
+    )
+
+
+def make_logistic_pipeline(feature_set: str, class_weight=None) -> Pipeline:
+    return Pipeline(
+        [
+            ("application", ApplicationPreparer()),
+            ("features", FeatureSetSelector(feature_set)),
+            ("encoding", one_hot_preprocessor()),
+            ("model", LogisticRegression(C=1.0, max_iter=400, solver="saga", n_jobs=-1, class_weight=class_weight, random_state=RANDOM_SEED)),
+        ]
+    )
+
+
+def make_hist_gb_pipeline(feature_set: str) -> Pipeline:
+    return Pipeline(
+        [
+            ("application", ApplicationPreparer()),
+            ("features", FeatureSetSelector(feature_set)),
+            ("encoding", ordinal_preprocessor()),
+            ("model", HistGradientBoostingClassifier(
+                learning_rate=0.08,
+                max_leaf_nodes=31,
+                l2_regularization=1.0,
+                early_stopping=True,
+                random_state=RANDOM_SEED,
+            )),
+        ]
+    )
+
+
+def make_random_forest_pipeline(feature_set: str, class_weight="balanced_subsample") -> Pipeline:
+    """A bounded forest benchmark; keep outer CV single-threaded."""
+    return Pipeline(
+        [
+            ("application", ApplicationPreparer()),
+            ("features", FeatureSetSelector(feature_set)),
+            ("encoding", ordinal_preprocessor()),
+            ("model", RandomForestClassifier(
+                n_estimators=160,
+                max_features="sqrt",
+                min_samples_leaf=20,
+                class_weight=class_weight,
+                n_jobs=-1,
+                random_state=RANDOM_SEED,
+            )),
+        ]
+    )
+
+
+def make_model_pipeline(model_family: str, feature_set: str) -> Pipeline:
+    """Return the approved candidate family with a common feature workflow."""
+    if model_family == "hist_gradient_boosting":
+        return make_hist_gb_pipeline(feature_set)
+    if model_family == "random_forest_class_weighted":
+        return make_random_forest_pipeline(feature_set)
+    if model_family == "logistic_all_unweighted":
+        return make_logistic_pipeline(feature_set, class_weight=None)
+    if model_family == "logistic_all_class_weighted":
+        return make_logistic_pipeline(feature_set, class_weight="balanced")
+    raise ValueError(f"No tunable pipeline defined for {model_family!r}")
+
+
+def tuning_distributions(model_family: str) -> dict:
+    """Small, model-specific randomized-search spaces; never an exhaustive grid."""
+    if model_family == "hist_gradient_boosting":
+        return {
+            "model__learning_rate": loguniform(0.02, 0.16),
+            "model__max_leaf_nodes": randint(15, 64),
+            "model__max_iter": randint(150, 500),
+            "model__min_samples_leaf": randint(20, 120),
+            "model__l2_regularization": loguniform(1e-3, 20.0),
+        }
+    if model_family == "random_forest_class_weighted":
+        return {
+            "model__n_estimators": randint(100, 350),
+            "model__max_depth": [None, 8, 12, 16],
+            "model__min_samples_leaf": randint(5, 60),
+            "model__max_features": ["sqrt", 0.5, None],
+        }
+    if model_family.startswith("logistic_all_"):
+        return {"model__C": loguniform(1e-3, 30.0)}
+    raise ValueError(f"No randomized-search distribution defined for {model_family!r}")
+
+
+def evaluate_holdout(name: str, estimator: Pipeline) -> tuple[Pipeline, dict[str, float | str]]:
+    """Fit only development data and return one untouched-holdout AUC."""
+    estimator.fit(X_dev, y_dev)
+    probabilities = estimator.predict_proba(X_holdout)[:, 1]
+    return estimator, {"experiment": name, "holdout_auc": roc_auc_score(y_holdout, probabilities)}
+```
+
+## 5. Cross-validated benchmark and candidate comparison
+
+Every model is compared with the same stratified three-fold out-of-sample
+procedure. A 100k-row development sample makes this first comparison practical;
+the tuning section uses only 5k rows. `accuracy` is retained as context, while
+mean cross-validated `roc_auc` ranks models.
+
+```{python}
+#| label: cross-validated-model-comparison
+if RUN_EXPLORATION_CV:
+    if len(X_dev) > EXPLORATION_SAMPLE_ROWS:
+        X_explore, _, y_explore, _ = train_test_split(
+            X_dev,
+            y_dev,
+            train_size=EXPLORATION_SAMPLE_ROWS,
+            random_state=RANDOM_SEED,
+            stratify=y_dev,
+        )
+    else:
+        X_explore, y_explore = X_dev, y_dev
+
+    exploration_cv = StratifiedKFold(n_splits=FAST_CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    candidate_models = {
+        "majority_class_baseline": DummyClassifier(strategy="most_frequent"),
+        "logistic_governed_unweighted": make_logistic_pipeline("governed_candidate", class_weight=None),
+        "logistic_all_unweighted": make_logistic_pipeline("all_engineered", class_weight=None),
+        "logistic_all_class_weighted": make_logistic_pipeline("all_engineered", class_weight="balanced"),
+        "random_forest_class_weighted": make_random_forest_pipeline("all_engineered"),
+        "hist_gradient_boosting": make_hist_gb_pipeline("all_engineered"),
+    }
+    comparison_rows = []
+    for name, estimator in candidate_models.items():
+        scores = cross_validate(
+            estimator,
+            X_explore,
+            y_explore,
+            scoring={"auc": "roc_auc", "accuracy": "accuracy"},
+            cv=exploration_cv,
+            n_jobs=SEARCH_N_JOBS,
+            return_train_score=False,
+        )
+        comparison_rows.append(
+            {
+                "model": name,
+                "cv_auc_mean": scores["test_auc"].mean(),
+                "cv_auc_std": scores["test_auc"].std(ddof=1),
+                "cv_accuracy_mean": scores["test_accuracy"].mean(),
+                "mean_fit_seconds": scores["fit_time"].mean(),
+            }
+        )
+    comparison_results = pd.DataFrame(comparison_rows).sort_values("cv_auc_mean", ascending=False)
+    display(comparison_results)
+else:
+    print("Candidate CV is paused. Set RUN_EXPLORATION_CV = True after checkpoint 3.")
+```
+
+**Interpretation.** The majority-class baseline should show deceptively high
+accuracy but AUC = 0.5. A useful model must exceed 0.5 AUC. Compare the two
+logistic rows directly to quantify the effect of class weighting; use AUC and
+its fold variation, rather than accuracy, to choose the tuning family.
+
+**Approval checkpoint 4:** inspect the benchmark, class-weighting comparison,
+and candidate AUC/runtime table. Set the tuning family only after this review.
+
+## 6. Randomized search on a development sample
+
+`RandomizedSearchCV` samples plausible parameter combinations instead of
+evaluating every point in a grid. This spends compute exploring more useful
+parts of a continuous parameter space. Search uses only development data; the
+holdout remains untouched. The deliberately small, stratified 5,000-row sample
+and three folds meet the assignment's speed requirement; the final refit still
+uses every labelled training row.
+
+```{python}
+#| label: randomized-search
+if RUN_RANDOM_SEARCH:
+    if FAST_MODE and len(X_dev) > TUNING_SAMPLE_ROWS:
+        X_search, _, y_search, _ = train_test_split(
+            X_dev,
+            y_dev,
+            train_size=TUNING_SAMPLE_ROWS,
+            random_state=RANDOM_SEED,
+            stratify=y_dev,
+        )
+    else:
+        X_search, y_search = X_dev, y_dev
+
+    search_cv = StratifiedKFold(
+        n_splits=FAST_CV_FOLDS if FAST_MODE else FINAL_CV_FOLDS,
+        shuffle=True,
+        random_state=RANDOM_SEED,
+    )
+    search = RandomizedSearchCV(
+        estimator=make_model_pipeline(SELECTED_MODEL_FAMILY, "all_engineered"),
+        param_distributions=tuning_distributions(SELECTED_MODEL_FAMILY),
+        n_iter=SEARCH_ITERATIONS,
+        scoring="roc_auc",
+        cv=search_cv,
+        n_jobs=SEARCH_N_JOBS,
+        refit=False,
+        random_state=RANDOM_SEED,
+        verbose=2,
+        return_train_score=False,
+    )
+    search.fit(X_search, y_search)
+
+    search_results = (
+        pd.DataFrame(search.cv_results_)
+        .sort_values("rank_test_score")
+        [["rank_test_score", "mean_test_score", "std_test_score", "mean_fit_time", "params"]]
+        .head(10)
+    )
+    display(search_results)
+    best_search_params = search_results.iloc[0]["params"]
+else:
+    print("Random search is paused. Set RUN_RANDOM_SEARCH = True after approving a boosting baseline.")
+```
+
+**Interpretation.** Prefer configurations with strong mean AUC, low fold-to-fold
+variation, and reasonable fit time.  A tiny apparent improvement that is
+smaller than the CV variation is weak evidence of a real improvement.
+
+**Approval checkpoint 5:** choose one parameter set and record it below before
+running feature ablations or 5-fold confirmation.
+
+## 7. Feature ablations and finalist cross-validation
+
+Copy the selected search parameters into `FINAL_PARAMS`.  This explicit step
+prevents accidental dependence on an in-memory search object and makes the
+chosen configuration visible in the rendered report.
+
+```{python}
+#| label: finalist-cross-validation
+# Replace these values with the approved RandomizedSearchCV result. If you chose
+# a non-boosting family, replace the entire dictionary with that family's
+# returned parameter keys (for example, `model__C` for logistic regression).
+FINAL_PARAMS = {
+    "model__learning_rate": 0.08,
+    "model__max_leaf_nodes": 31,
+    "model__max_iter": 300,
+    "model__min_samples_leaf": 40,
+    "model__l2_regularization": 1.0,
+}
+
+if RUN_FINAL_CV:
+    final_cv = StratifiedKFold(n_splits=FINAL_CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    finalists = []
+    for feature_set in FEATURE_SET_LABELS:
+        candidate = make_model_pipeline(SELECTED_MODEL_FAMILY, feature_set).set_params(**FINAL_PARAMS)
+        scores = cross_validate(
+            candidate,
+            X_dev,
+            y_dev,
+            scoring="roc_auc",
+            cv=final_cv,
+            n_jobs=SEARCH_N_JOBS,
+            return_train_score=False,
+        )["test_score"]
+        finalists.append(
+            {
+                "feature_set": feature_set,
+                "cv_auc_mean": scores.mean(),
+                "cv_auc_std": scores.std(ddof=1),
+                "cv_auc_min": scores.min(),
+                "cv_auc_max": scores.max(),
+            }
+        )
+    finalist_results = pd.DataFrame(finalists).sort_values("cv_auc_mean", ascending=False)
+    display(finalist_results)
+else:
+    print("Finalist CV is paused. Set RUN_FINAL_CV = True after recording FINAL_PARAMS.")
+```
+
+**Interpretation.** This table is the primary experiment leaderboard.  Choose
+the feature set by performance *and* governance approval.  It is reasonable to
+accept a slightly lower-AUC feature set if it has clearer provenance and lower
+proxy risk.
+
+**Approval checkpoint 6:** freeze the selected feature set and parameters.
+
+## 8. One-time holdout assessment
+
+Only run this after finalizing the configuration above.  Do not return to tune
+parameters based on this result; doing so would turn the holdout into another
+training signal.
+
+```{python}
+#| label: final-holdout-assessment
+FINAL_FEATURE_SET = "all_engineered"  # Replace with approved finalist.
+
+if RUN_FINAL_CV:
+    final_candidate = make_model_pipeline(SELECTED_MODEL_FAMILY, FINAL_FEATURE_SET).set_params(**FINAL_PARAMS)
+    final_candidate, final_holdout = evaluate_holdout("approved_finalist", final_candidate)
+    display(pd.DataFrame([final_holdout]))
+
+    RocCurveDisplay.from_predictions(y_holdout, final_candidate.predict_proba(X_holdout)[:, 1])
+else:
+    print("Final holdout assessment waits for approved finalist CV.")
+```
+
+**Interpretation.** Compare the holdout AUC with development-CV AUC.  A large
+drop suggests instability, overfitting, or sampling variation and should be
+investigated before test scoring.
+
+## 9. Refit on all labelled rows and create test probabilities
+
+This final operation is intentionally disabled.  It fits the already-approved
+pipeline on every labelled row, validates the train/test transformation schema,
+and writes one prediction per test application.  It does **not** claim a test
+AUC.  The file-write guard prevents silently overwriting an existing artifact.
+
+```{python}
+#| label: test-scoring-artifact
+if RUN_TEST_SCORING:
+    approved_pipeline = make_model_pipeline(SELECTED_MODEL_FAMILY, FINAL_FEATURE_SET).set_params(**FINAL_PARAMS)
+    approved_pipeline.fit(X_raw, y)
+
+    # Separate audit state: used only to verify the repository's stated
+    # train/test invariants before scoring.  The fitted estimator has its own
+    # equivalent state learned from all labelled rows.
+    full_state = fit_application_preparation(train_raw)
+    full_train_features = transform_application(train_raw, full_state)
+    full_test_features = transform_application(test_raw, full_state)
+    display(pd.DataFrame([validate_prepared_outputs(train_raw, test_raw, full_train_features, full_test_features)]))
+
+    if SUBMISSION_PATH.exists() or MODEL_PATH.exists():
+        raise FileExistsError(
+            "A final artifact already exists. Review/version it deliberately before overwriting: "
+            f"{SUBMISSION_PATH}"
+        )
+
+    test_probability = approved_pipeline.predict_proba(test_raw)[:, 1]
+    submission = pd.DataFrame({ID_COLUMN: test_raw[ID_COLUMN], TARGET_COLUMN: test_probability})
+    assert submission[ID_COLUMN].is_unique and submission[TARGET_COLUMN].between(0, 1).all()
+
+    dump(approved_pipeline, MODEL_PATH)
+    submission.to_csv(SUBMISSION_PATH, index=False)
+    display(submission.head())
+    display(submission[TARGET_COLUMN].describe().to_frame("test_predicted_probability"))
+    print(f"Saved model: {MODEL_PATH}")
+    print(f"Saved test predictions: {SUBMISSION_PATH}")
+else:
+    print("Test scoring is paused. Set RUN_TEST_SCORING = True only after final approval.")
+```
+
+## 10. Kaggle submission and score record
+
+After reviewing the generated CSV, submit it through the assigned Kaggle
+competition page (or the Kaggle API after configuring the account credentials).
+Submission changes an external account, so this notebook deliberately does not
+submit automatically. Enter the returned leaderboard score below and copy the
+same record to `docs/modeling_results.md` and the README.
+
+```{python}
+#| label: kaggle-score-record
+KAGGLE_COMPETITION = ""  # Enter the course-assigned competition slug.
+KAGGLE_SUBMISSION_DATE = ""  # YYYY-MM-DD
+KAGGLE_PUBLIC_AUC = None  # Enter the score returned by Kaggle.
+KAGGLE_PRIVATE_AUC = None  # Usually unavailable until competition close.
+
+kaggle_record = pd.DataFrame(
+    [{
+        "competition": KAGGLE_COMPETITION or "not submitted",
+        "submission_file": str(SUBMISSION_PATH.relative_to(PROJECT_ROOT)),
+        "public_auc": KAGGLE_PUBLIC_AUC,
+        "private_auc": KAGGLE_PRIVATE_AUC,
+        "submission_date": KAGGLE_SUBMISSION_DATE or "not submitted",
+    }]
+)
+display(kaggle_record)
+```
+
+## Decision record
+
+Record the selected configuration and rationale when the experiment is
+complete.  This keeps modeling decisions auditable and separates empirical
+performance from governance approval.
+
+| Item | Decision / evidence |
+|---|---|
+| Validation design | Stratified development/holdout split; 5-fold stratified CV on development data |
+| Metric | ROC-AUC |
+| Chosen algorithm and parameters | _Fill after randomized search_ |
+| Chosen feature set | _Fill after ablation and governance review_ |
+| Holdout AUC | _Fill once; do not tune against it_ |
+| Test-scoring date and artifact paths | _Fill after final refit_ |
+| Kaggle public/private AUC | _Fill after manual submission_ |
+| Known limitations | No temporal split/date field; test labels unavailable locally; external-score and proxy-feature governance remains required |

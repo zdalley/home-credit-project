@@ -20,3 +20,7 @@ models/*
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# Rendered notebooks are assignment deliverables kept locally; commit source
+# notebooks, not their potentially large rendered output.
+notebooks/*.html

@@ -119,3 +119,22 @@ The supplied-data validation report is:
 ```
 
 This confirms that train and test have the same 276 feature columns (with `TARGET` kept outside the feature matrix) and that preparation preserved one row per validated `SK_ID_CURR`. For cross-validation, fit a new preparation state on each fold's training subset, then transform that fold's validation subset. This prevents validation-data leakage.
+
+## Modeling notebook
+
+[`notebooks/02_modeling.qmd`](notebooks/02_modeling.qmd) is the staged Python
+modeling notebook. It establishes a majority-class benchmark (accuracy and
+AUC), then uses three-fold cross-validation to compare unweighted and
+class-weighted logistic regression, a class-weighted random forest, and
+histogram gradient boosting. Models are ranked by out-of-sample ROC-AUC rather
+than accuracy because `TARGET` is imbalanced. It uses a 5,000-row stratified
+sample and 20--25 randomized-search trials for fast hyperparameter exploration,
+then confirms finalists with five-fold CV and refits the approved model on all
+labelled rows before generating a test-probability CSV.
+
+The notebook defaults to paused compute stages so results are never fabricated
+in documentation. After rendering it, record the measured model comparison,
+selected model, holdout AUC, and Kaggle score in
+[`docs/modeling_results.md`](docs/modeling_results.md). Render locally with
+`quarto render notebooks/02_modeling.qmd`; commit the `.qmd` source, while
+model files, submissions, and rendered HTML remain local/ignored.
