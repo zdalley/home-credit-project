@@ -123,18 +123,21 @@ This confirms that train and test have the same 276 feature columns (with `TARGE
 ## Modeling notebook
 
 [`notebooks/02_modeling.qmd`](notebooks/02_modeling.qmd) is the staged Python
-modeling notebook. It establishes a majority-class benchmark (accuracy and
-AUC), then uses three-fold cross-validation to compare unweighted and
+modeling notebook. It establishes a majority-class benchmark (91.93% accuracy
+but 0.500 AUC), then uses three-fold cross-validation to compare unweighted and
 class-weighted logistic regression, a class-weighted random forest, and
-histogram gradient boosting. Models are ranked by out-of-sample ROC-AUC rather
-than accuracy because `TARGET` is imbalanced. It uses a 5,000-row stratified
-sample and 20--25 randomized-search trials for fast hyperparameter exploration,
-then confirms finalists with five-fold CV and refits the approved model on all
-labelled rows before generating a test-probability CSV.
+histogram gradient boosting. On the 25,000-row exploration sample, governed
+unweighted logistic regression led at 0.7563 AUC; gradient boosting was 0.7544.
+After a 5,000-row randomized search selected `C = 0.0020008546`, full-
+development five-fold confirmation chose the all-engineered logistic model
+(0.7478 ± 0.0043 AUC), which earned 0.7537 on the untouched holdout. Models are
+ranked by out-of-sample ROC-AUC rather than accuracy because `TARGET` is
+imbalanced.
 
-The notebook defaults to paused compute stages so results are never fabricated
-in documentation. After rendering it, record the measured model comparison,
-selected model, holdout AUC, and Kaggle score in
+The notebook defaults to paused compute stages so expensive experiments are
+never accidentally repeated. The local submission artifact is
+`data/processed/home_credit_test_predictions.csv`; submit it manually to the
+course Kaggle competition, then record the returned score in
 [`docs/modeling_results.md`](docs/modeling_results.md). Render locally with
 `quarto render notebooks/02_modeling.qmd`; commit the `.qmd` source, while
 model files, submissions, and rendered HTML remain local/ignored.

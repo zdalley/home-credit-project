@@ -11,7 +11,9 @@ format:
 execute:
   echo: true
   warning: false
-  freeze: auto
+  # Staged runs are controlled by RUN_* environment switches below.  Do not
+  # freeze execution here, or Quarto may reuse a previous stage's output.
+  freeze: false
 jupyter: python3
 ---
 
@@ -39,12 +41,13 @@ from __future__ import annotations
 import platform
 import sys
 import warnings
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import sklearn
-from joblib import dump
+import cloudpickle
 from scipy.stats import loguniform, randint
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, make_column_selector
@@ -91,8 +94,10 @@ HOLDOUT_FRACTION = 0.20
 
 # Runtime controls.  Start fast, then use all data and 5 folds only for finalists.
 FAST_MODE = True
-EXPLORATION_SAMPLE_ROWS = 100_000
-TUNING_SAMPLE_ROWS = 5_000
+# A 25k stratified sample keeps the six-model/three-fold comparison practical
+# on a laptop. Finalist confirmation and the production fit use all rows.
+EXPLORATION_SAMPLE_ROWS = int(os.getenv("EXPLORATION_SAMPLE_ROWS", "25000"))
+TUNING_SAMPLE_ROWS = int(os.getenv("TUNING_SAMPLE_ROWS", "5000"))
 FAST_CV_FOLDS = 3
 FINAL_CV_FOLDS = 5
 SEARCH_ITERATIONS = 25
@@ -103,14 +108,20 @@ SEARCH_N_JOBS = 1
 
 # Approval switches: set the next switch to True only after reviewing the
 # preceding output.  This makes long-running sections opt-in by default.
-RUN_EXPLORATION_CV = False
-RUN_RANDOM_SEARCH = False
-RUN_FINAL_CV = False
-RUN_TEST_SCORING = False
+def env_flag(name: str, default: bool = False) -> bool:
+    """Allow a one-off rendered stage without editing the committed defaults."""
+    return os.getenv(name, str(default)).lower() in {"1", "true", "yes"}
 
-# Set after reviewing the cross-validated comparison. The default is a starting
-# hypothesis, not a claim that gradient boosting has already won.
-SELECTED_MODEL_FAMILY = "hist_gradient_boosting"
+
+RUN_EXPLORATION_CV = env_flag("RUN_EXPLORATION_CV")
+RUN_RANDOM_SEARCH = env_flag("RUN_RANDOM_SEARCH")
+RUN_FINAL_CV = env_flag("RUN_FINAL_CV")
+RUN_HOLDOUT_ASSESSMENT = env_flag("RUN_HOLDOUT_ASSESSMENT")
+RUN_TEST_SCORING = env_flag("RUN_TEST_SCORING")
+
+# This value was selected from the documented three-fold comparison below.
+# Re-run that comparison if data, feature policy, or sample design changes.
+SELECTED_MODEL_FAMILY = os.getenv("SELECTED_MODEL_FAMILY", "logistic_all_unweighted")
 
 TRAIN_PATH = PROJECT_ROOT / "data/raw/application_train.csv"
 TEST_PATH = PROJECT_ROOT / "data/raw/application_test.csv"
@@ -377,7 +388,7 @@ def make_logistic_pipeline(feature_set: str, class_weight=None) -> Pipeline:
             ("application", ApplicationPreparer()),
             ("features", FeatureSetSelector(feature_set)),
             ("encoding", one_hot_preprocessor()),
-            ("model", LogisticRegression(C=1.0, max_iter=400, solver="saga", n_jobs=-1, class_weight=class_weight, random_state=RANDOM_SEED)),
+            ("model", LogisticRegression(C=1.0, max_iter=200, solver="saga", n_jobs=-1, class_weight=class_weight, random_state=RANDOM_SEED)),
         ]
     )
 
@@ -407,7 +418,7 @@ def make_random_forest_pipeline(feature_set: str, class_weight="balanced_subsamp
             ("features", FeatureSetSelector(feature_set)),
             ("encoding", ordinal_preprocessor()),
             ("model", RandomForestClassifier(
-                n_estimators=160,
+                n_estimators=100,
                 max_features="sqrt",
                 min_samples_leaf=20,
                 class_weight=class_weight,
@@ -425,6 +436,8 @@ def make_model_pipeline(model_family: str, feature_set: str) -> Pipeline:
     if model_family == "random_forest_class_weighted":
         return make_random_forest_pipeline(feature_set)
     if model_family == "logistic_all_unweighted":
+        return make_logistic_pipeline(feature_set, class_weight=None)
+    if model_family == "logistic_governed_unweighted":
         return make_logistic_pipeline(feature_set, class_weight=None)
     if model_family == "logistic_all_class_weighted":
         return make_logistic_pipeline(feature_set, class_weight="balanced")
@@ -448,7 +461,7 @@ def tuning_distributions(model_family: str) -> dict:
             "model__min_samples_leaf": randint(5, 60),
             "model__max_features": ["sqrt", 0.5, None],
         }
-    if model_family.startswith("logistic_all_"):
+    if model_family.startswith("logistic_"):
         return {"model__C": loguniform(1e-3, 30.0)}
     raise ValueError(f"No randomized-search distribution defined for {model_family!r}")
 
@@ -520,6 +533,22 @@ else:
 accuracy but AUC = 0.5. A useful model must exceed 0.5 AUC. Compare the two
 logistic rows directly to quantify the effect of class weighting; use AUC and
 its fold variation, rather than accuracy, to choose the tuning family.
+
+### Recorded exploration result
+
+The following run used the fixed 25,000-row stratified development sample and
+three folds. It illustrates why accuracy is not the selection metric: the
+majority classifier matched the approximate 91.9% non-default prevalence yet
+had no ranking ability (AUC = 0.500).
+
+| Model | Mean CV AUC | AUC SD | Mean accuracy |
+|---|---:|---:|---:|
+| Majority class | 0.5000 | 0.0000 | 0.9193 |
+| Logistic, governed feature set, unweighted | 0.7563 | 0.0023 | 0.9193 |
+| Histogram gradient boosting | 0.7544 | 0.0043 | 0.9192 |
+| Logistic, all engineered, unweighted | 0.7542 | 0.0052 | 0.9192 |
+| Logistic, all engineered, class-weighted | 0.7533 | 0.0056 | 0.7036 |
+| Random forest, class-weighted | 0.7489 | 0.0058 | 0.8471 |
 
 **Approval checkpoint 4:** inspect the benchmark, class-weighting comparison,
 and candidate AUC/runtime table. Set the tuning family only after this review.
@@ -597,11 +626,7 @@ chosen configuration visible in the rendered report.
 # a non-boosting family, replace the entire dictionary with that family's
 # returned parameter keys (for example, `model__C` for logistic regression).
 FINAL_PARAMS = {
-    "model__learning_rate": 0.08,
-    "model__max_leaf_nodes": 31,
-    "model__max_iter": 300,
-    "model__min_samples_leaf": 40,
-    "model__l2_regularization": 1.0,
+    "model__C": 0.0020008545549484993,
 }
 
 if RUN_FINAL_CV:
@@ -650,19 +675,29 @@ training signal.
 #| label: final-holdout-assessment
 FINAL_FEATURE_SET = "all_engineered"  # Replace with approved finalist.
 
-if RUN_FINAL_CV:
+if RUN_HOLDOUT_ASSESSMENT:
     final_candidate = make_model_pipeline(SELECTED_MODEL_FAMILY, FINAL_FEATURE_SET).set_params(**FINAL_PARAMS)
     final_candidate, final_holdout = evaluate_holdout("approved_finalist", final_candidate)
     display(pd.DataFrame([final_holdout]))
 
     RocCurveDisplay.from_predictions(y_holdout, final_candidate.predict_proba(X_holdout)[:, 1])
 else:
-    print("Final holdout assessment waits for approved finalist CV.")
+    print("Final holdout assessment waits for an approved finalist configuration.")
 ```
 
 **Interpretation.** Compare the holdout AUC with development-CV AUC.  A large
 drop suggests instability, overfitting, or sampling variation and should be
 investigated before test scoring.
+
+### Recorded finalist result
+
+Randomized search selected `C = 0.0020008546` for the unweighted logistic
+model (5,000 rows; three folds). On the full development partition, five-fold
+feature-set confirmation selected `all_engineered` (AUC 0.7478 ± 0.0043), ahead
+of `governed_candidate` (0.7448 ± 0.0040); removing external scores fell to
+0.6845 ± 0.0037. The selected all-engineered logistic model achieved **0.7537
+ROC-AUC** on the untouched 20% holdout. This performance evidence does not
+replace the governance review required for external-score and proxy-risk fields.
 
 ## 9. Refit on all labelled rows and create test probabilities
 
@@ -695,8 +730,11 @@ if RUN_TEST_SCORING:
     submission = pd.DataFrame({ID_COLUMN: test_raw[ID_COLUMN], TARGET_COLUMN: test_probability})
     assert submission[ID_COLUMN].is_unique and submission[TARGET_COLUMN].between(0, 1).all()
 
-    dump(approved_pipeline, MODEL_PATH)
     submission.to_csv(SUBMISSION_PATH, index=False)
+    # The pipeline includes small helper classes defined in this notebook.
+    # cloudpickle preserves those notebook-defined classes for local reuse.
+    with MODEL_PATH.open("wb") as model_file:
+        cloudpickle.dump(approved_pipeline, model_file)
     display(submission.head())
     display(submission[TARGET_COLUMN].describe().to_frame("test_predicted_probability"))
     print(f"Saved model: {MODEL_PATH}")
