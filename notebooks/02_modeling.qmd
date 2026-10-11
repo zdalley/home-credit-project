@@ -7,7 +7,9 @@ format:
     toc: true
     toc-depth: 3
     code-fold: true
-    embed-resources: false
+    # Canvas often strips or cannot serve Quarto's adjacent *_files assets.
+    # Embed CSS, JavaScript, and images into this one portable HTML file.
+    embed-resources: true
 execute:
   echo: true
   warning: false
