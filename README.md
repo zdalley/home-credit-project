@@ -141,3 +141,8 @@ course Kaggle competition, then record the returned score in
 [`docs/modeling_results.md`](docs/modeling_results.md). Render locally with
 `quarto render notebooks/02_modeling.qmd`; commit the `.qmd` source, while
 model files, submissions, and rendered HTML remain local/ignored.
+
+The submitted application-only model earned **0.74133 public ROC-AUC** and
+**0.73543 private ROC-AUC** on the course Kaggle competition. The private score
+is the relevant final leaderboard estimate; it is modestly below the local
+holdout result (0.7537), as expected from split-to-split variation.

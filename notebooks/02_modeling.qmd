@@ -753,10 +753,10 @@ same record to `docs/modeling_results.md` and the README.
 
 ```{python}
 #| label: kaggle-score-record
-KAGGLE_COMPETITION = ""  # Enter the course-assigned competition slug.
-KAGGLE_SUBMISSION_DATE = ""  # YYYY-MM-DD
-KAGGLE_PUBLIC_AUC = None  # Enter the score returned by Kaggle.
-KAGGLE_PRIVATE_AUC = None  # Usually unavailable until competition close.
+KAGGLE_COMPETITION = "course Home Credit competition"  # Course-specific slug was not retained locally.
+KAGGLE_SUBMISSION_DATE = "2026-10-10"
+KAGGLE_PUBLIC_AUC = 0.74133
+KAGGLE_PRIVATE_AUC = 0.73543
 
 kaggle_record = pd.DataFrame(
     [{

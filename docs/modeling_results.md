@@ -25,11 +25,11 @@ results.
 
 ## Kaggle submission
 
-- **Competition:** _fill_
+- **Competition:** Course Home Credit competition
 - **Submission file:** `data/processed/home_credit_test_predictions.csv`
-- **Submission date:** _fill_
-- **Public score:** _fill_
-- **Private/final score:** _fill when available_
+- **Submission date:** 2026-10-10
+- **Public score:** 0.74133 ROC-AUC
+- **Private/final score:** 0.73543 ROC-AUC
 
 ## Limitations
 
