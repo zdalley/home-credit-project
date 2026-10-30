@@ -146,3 +146,40 @@ The submitted application-only model earned **0.74133 public ROC-AUC** and
 **0.73543 private ROC-AUC** on the course Kaggle competition. The private score
 is the relevant final leaderboard estimate; it is modestly below the local
 holdout result (0.7537), as expected from split-to-split variation.
+
+## Model card
+
+[`notebooks/03_model_card.qmd`](notebooks/03_model_card.qmd) documents the final
+model for a business stakeholder deciding whether it is ready to deploy. It
+combines model details and intended use with performance, a sourced
+cost-sensitive threshold analysis, SHAP explanations on a 1,000-row sample,
+plain-language adverse-action mappings, and approval-rate comparisons by
+gender and education.
+
+The base lending scenario produces a provisional **10.8% payment-difficulty
+cutoff**. On the untouched holdout, that cutoff approves 76.1% of applications,
+recalls 56.3% of observed payment-difficulty cases, and has 19.0% precision
+among flagged cases. Under the stated standardized-loan assumptions, its
+estimated incremental value is $1.67 million per 10,000 applications versus
+approving everyone. This is a sensitivity-tested scenario, not a financial
+forecast.
+
+The card's recommendation is **not to deploy the current artifact for
+autonomous approvals or denials**. Gender is an influential model input, group
+approval rates differ materially, probabilities require out-of-time
+calibration, the logistic solver reached its iteration cap, and several
+external/proxy fields lack sufficient provenance for compliant customer
+explanations. The proposed next step is protected-feature remediation followed
+by shadow testing and a controlled human-review pilot.
+
+Render locally with:
+
+```bash
+/Applications/Positron.app/Contents/Resources/app/quarto/bin/quarto render notebooks/03_model_card.qmd --to html
+```
+
+The source code remains in the committed `.qmd`, while the rendered HTML hides
+code and embeds its figures and styling in one Canvas-portable file. The HTML,
+saved model, holdout-score cache, and other generated artifacts remain local
+and are excluded by `.gitignore`. The model-card environment additionally
+requires the `shap` Python package.

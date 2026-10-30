@@ -1,0 +1,799 @@
+---
+title: "Home Credit Payment-Difficulty Model Card"
+subtitle: "Version 1.0 — deployment-readiness review"
+author: "Zack Dalley"
+date: "2026-10-29"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+    code-fold: false
+    code-tools: false
+    smooth-scroll: true
+    fig-responsive: true
+execute:
+  echo: false
+  warning: false
+  error: true
+  freeze: false
+jupyter: python3
+---
+
+```{python}
+#| label: setup
+#| output: false
+from __future__ import annotations
+
+import sys
+import warnings
+from pathlib import Path
+
+import cloudpickle
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import shap
+from IPython.display import HTML, Markdown, display
+from sklearn.base import clone
+from sklearn.calibration import calibration_curve
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.metrics import (
+    brier_score_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+sns.set_theme(style="whitegrid", context="notebook")
+
+
+def find_project_root(start: Path) -> Path:
+    """Locate the repository when Quarto starts in the root or notebooks/."""
+    for candidate in (start, *start.parents):
+        if (candidate / "src" / "application_preparation.py").exists():
+            return candidate
+    raise FileNotFoundError("Could not locate the project root.")
+
+
+PROJECT_ROOT = find_project_root(Path.cwd().resolve())
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+TRAIN_PATH = PROJECT_ROOT / "data/raw/application_train.csv"
+MODEL_PATH = PROJECT_ROOT / "models/home_credit_final_pipeline.joblib"
+HOLDOUT_SCORE_PATH = PROJECT_ROOT / "data/processed/model_card_holdout_scores.csv"
+RANDOM_SEED = 20261009
+
+train_raw = pd.read_csv(TRAIN_PATH)
+X_raw = train_raw.drop(columns="TARGET")
+y = train_raw["TARGET"].astype("int8")
+X_dev, X_holdout, y_dev, y_holdout = train_test_split(
+    X_raw,
+    y,
+    test_size=0.20,
+    random_state=RANDOM_SEED,
+    stratify=y,
+)
+
+with MODEL_PATH.open("rb") as model_file:
+    production_model = cloudpickle.load(model_file)
+
+# Economic base case, normalized to a $10,000, 24-month amortizing loan.
+PRINCIPAL = 10_000.0
+ANNUAL_RATE = 0.1190
+FUNDING_RATE = 0.0338
+RECOVERY_RATE = 0.24
+LGD_RATE = 1 - RECOVERY_RATE
+TERM_MONTHS = 24
+
+monthly_rate = ANNUAL_RATE / 12
+monthly_payment = PRINCIPAL * monthly_rate / (1 - (1 + monthly_rate) ** -TERM_MONTHS)
+balance = PRINCIPAL
+gross_interest = 0.0
+funding_cost = 0.0
+for _ in range(TERM_MONTHS):
+    gross_interest += balance * monthly_rate
+    funding_cost += balance * FUNDING_RATE / 12
+    balance = balance + balance * monthly_rate - monthly_payment
+
+GOOD_LOAN_VALUE = gross_interest - funding_cost
+BAD_LOAN_LOSS = PRINCIPAL * LGD_RATE
+DECISION_THRESHOLD = GOOD_LOAN_VALUE / (GOOD_LOAN_VALUE + BAD_LOAN_LOSS)
+
+# Reuse cached honest holdout scores when available. The deployed artifact was
+# trained on all labelled rows, so scoring the holdout with it would leak. If
+# the cache is absent, clone its exact configuration and fit development data
+# once; no model selection or tuning occurs here.
+expected_ids = set(X_holdout["SK_ID_CURR"])
+if HOLDOUT_SCORE_PATH.exists():
+    holdout_scores = pd.read_csv(HOLDOUT_SCORE_PATH)
+    cache_valid = (
+        len(holdout_scores) == len(X_holdout)
+        and set(holdout_scores["SK_ID_CURR"]) == expected_ids
+        and holdout_scores["TARGET"].isin([0, 1]).all()
+    )
+else:
+    cache_valid = False
+
+if not cache_valid:
+    evaluation_model = clone(production_model)
+    evaluation_model.fit(X_dev, y_dev)
+    holdout_scores = pd.DataFrame(
+        {
+            "SK_ID_CURR": X_holdout["SK_ID_CURR"].to_numpy(),
+            "TARGET": y_holdout.to_numpy(),
+            "predicted_probability": evaluation_model.predict_proba(X_holdout)[:, 1],
+        }
+    )
+    HOLDOUT_SCORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    holdout_scores.to_csv(HOLDOUT_SCORE_PATH, index=False)
+
+holdout_scores = holdout_scores.set_index("SK_ID_CURR").loc[X_holdout["SK_ID_CURR"]].reset_index()
+y_holdout_array = holdout_scores["TARGET"].to_numpy()
+holdout_probability = holdout_scores["predicted_probability"].to_numpy()
+predicted_difficulty = holdout_probability >= DECISION_THRESHOLD
+approved = ~predicted_difficulty
+
+holdout_auc = roc_auc_score(y_holdout_array, holdout_probability)
+threshold_precision = precision_score(y_holdout_array, predicted_difficulty)
+threshold_recall = recall_score(y_holdout_array, predicted_difficulty)
+approval_rate = approved.mean()
+approved_bad_rate = y_holdout_array[approved].mean()
+brier = brier_score_loss(y_holdout_array, holdout_probability)
+
+
+def economics_at_threshold(threshold: float, good_value: float, bad_loss: float) -> dict[str, float]:
+    """Observed holdout economics when scores at/above threshold are declined."""
+    flagged = holdout_probability >= threshold
+    accepted = ~flagged
+    good_accepted = ((y_holdout_array == 0) & accepted).sum()
+    bad_accepted = ((y_holdout_array == 1) & accepted).sum()
+    value = good_accepted * good_value - bad_accepted * bad_loss
+    return {
+        "threshold": threshold,
+        "approval_rate": accepted.mean(),
+        "precision": precision_score(y_holdout_array, flagged, zero_division=0),
+        "recall": recall_score(y_holdout_array, flagged, zero_division=0),
+        "bad_rate_approved": y_holdout_array[accepted].mean() if accepted.any() else np.nan,
+        "value_per_10k": value / len(y_holdout_array) * 10_000,
+    }
+
+
+base_result = economics_at_threshold(DECISION_THRESHOLD, GOOD_LOAN_VALUE, BAD_LOAN_LOSS)
+approve_all_value = (
+    (y_holdout_array == 0).sum() * GOOD_LOAN_VALUE
+    - (y_holdout_array == 1).sum() * BAD_LOAN_LOSS
+) / len(y_holdout_array) * 10_000
+incremental_value = base_result["value_per_10k"] - approve_all_value
+
+assert abs(holdout_auc - 0.7536763678) < 1e-6
+assert 0.10 < DECISION_THRESHOLD < 0.12
+```
+
+# Executive summary {.unnumbered}
+
+::: {.callout-important title="Recommendation: do not deploy this model for autonomous approvals or denials"}
+The model demonstrates useful risk ranking, but the current artifact is **not
+deployment-ready**. Use it only in a controlled shadow test while the team
+removes protected and high-risk proxy variables, recalibrates probabilities,
+validates compliant adverse-action reasons, and repeats fairness testing.
+:::
+
+```{python}
+#| label: executive-metrics
+summary_metrics = pd.DataFrame(
+    {
+        "Measure": [
+            "Untouched-holdout AUC",
+            "Provisional cutoff",
+            "Approval rate at cutoff",
+            "Recall of payment difficulties",
+            "Precision among flagged cases",
+            "Scenario value vs. approve-all",
+        ],
+        "Result": [
+            f"{holdout_auc:.3f}",
+            f"{DECISION_THRESHOLD:.1%}",
+            f"{approval_rate:.1%}",
+            f"{threshold_recall:.1%}",
+            f"{threshold_precision:.1%}",
+            f"+${incremental_value / 1_000_000:.2f}M per 10,000 applications",
+        ],
+    }
+)
+display(summary_metrics.style.hide(axis="index").set_properties(**{"text-align": "left"}))
+```
+
+The final L2-regularized logistic model separates higher- and lower-risk
+applications meaningfully: its untouched-holdout AUC is **0.754**, and its
+Kaggle private AUC is **0.735**. A sourced lending-cost scenario produces a
+provisional **10.8% payment-difficulty cutoff**. On the holdout, that cutoff
+approves 76.1% of applications and detects 56.3% of observed payment-difficulty
+cases. Precision is only 19.0%, so most flagged applicants did not experience
+the outcome; the score is better suited to prioritizing review than acting as
+an automatic rejection rule.
+
+Under the base assumptions, the cutoff adds an estimated **$1.67 million per
+10,000 applications** relative to approving everyone. This is a scenario, not
+a forecast: it assumes a standardized loan, treats `TARGET=1` like default,
+and excludes servicing, acquisition, compliance, and customer-friction costs.
+
+The most important caveat is fairness. `CODE_GENDER` is itself a model input
+and is among the strongest SHAP features. At the provisional cutoff, observed
+approval rates are approximately **81.0% for women and 66.8% for men**. Education
+groups also differ materially. These statistics do not establish causation or
+unlawful discrimination, but they are a clear governance warning. A U.S.
+lender generally may not use sex in a credit decision; legal and compliance
+review is required before any operational use.
+
+# Model details
+
+This card follows the transparency goals in Mitchell et al.'s
+[Model Cards for Model Reporting](https://arxiv.org/abs/1810.03993) and the
+[Hugging Face Model Card Guidebook](https://huggingface.co/docs/hub/en/model-card-guidebook):
+state what the model does, document evaluation conditions, disclose subgroup
+behavior, and identify uses for which the model is not suitable.
+
+| Item | Documentation |
+|---|---|
+| Model name and version | Home Credit payment-difficulty model, version 1.0 (2026-10-29) |
+| Owner | Zack Dalley; individual MSBA Practice Capstone project |
+| Model type | Binary L2-regularized logistic regression with standardized numeric and one-hot categorical inputs |
+| Output | Estimated probability-like score for `TARGET=1` |
+| Final feature set | All 276 application-level features emitted by `src/application_preparation.py`, followed by model-specific encoding |
+| Training data | 307,511 labelled Home Credit applications; 8.07% `TARGET=1` |
+| Validation design | Fixed 80/20 stratified development/holdout split; five-fold CV on development data |
+| Key hyperparameters | `C=0.0020008545549484993`, `penalty=L2`, `solver=saga`, `max_iter=200`, no class weighting |
+| Local artifact | `models/home_credit_final_pipeline.joblib` (kept local and ignored by Git) |
+
+The production artifact was refit on all labelled rows after model selection.
+For unbiased threshold metrics, this card uses predictions from an exact clone
+fit only on the original development partition. That one-time evaluation fit
+is cached locally; the card does not repeat model search or tuning.
+
+::: {.callout-warning title="Training diagnostic"}
+The logistic solver reached its 200-iteration cap. Ranking performance was
+stable enough for this project, but coefficients and SHAP explanations should
+not be treated as production-final until the model is refit to convergence and
+the results are revalidated.
+:::
+
+# Intended use
+
+## Appropriate users and decisions
+
+The intended users are credit-risk, underwriting, model-risk, compliance, and
+operations teams evaluating a controlled pilot. The model may:
+
+- rank otherwise eligible applications for additional affordability or
+  documentation review;
+- support portfolio-level capacity planning and risk-tier design; and
+- provide a challenger score in shadow mode while decisions continue under
+  existing approved policy.
+
+## Uses outside scope
+
+The model is **not** designed to:
+
+- automatically approve, deny, price, or set limits for consumer credit;
+- determine fraud, identity, protected-class status, or willingness to repay;
+- replace required underwriting checks or adverse-action procedures;
+- generalize to another country, lender, product, or time period without
+  validation; or
+- estimate loss given default, exposure at default, or causal effects.
+
+`TARGET=1` is a competition-defined payment-difficulty outcome. It should not
+be described as certain or complete default. The score estimates association
+with that label, not a moral judgment about an applicant.
+
+# Performance metrics
+
+```{python}
+#| label: performance-table
+performance = pd.DataFrame(
+    [
+        ["Majority-class benchmark", "3-fold exploration", 0.5000, np.nan, np.nan, "25,000-row sample"],
+        ["Selected logistic model", "5-fold development CV", 0.7478, np.nan, np.nan, "SD = 0.0043"],
+        ["Selected logistic model", "Untouched 20% holdout", holdout_auc, threshold_precision, threshold_recall, f"At {DECISION_THRESHOLD:.1%} cutoff"],
+        ["Submitted model", "Kaggle public", 0.74133, np.nan, np.nan, "Leaderboard AUC only"],
+        ["Submitted model", "Kaggle private", 0.73543, np.nan, np.nan, "Final leaderboard estimate"],
+    ],
+    columns=["Model", "Evaluation", "AUC", "Precision", "Recall", "Notes"],
+)
+display(
+    performance.style.hide(axis="index").format(
+        {"AUC": "{:.4f}", "Precision": "{:.1%}", "Recall": "{:.1%}"},
+        na_rep="—",
+    )
+)
+```
+
+AUC measures ranking, not probability accuracy or financial value. The
+holdout Brier score is `{python} f"{brier:.4f}"`; calibration should be
+re-estimated on a newer, time-based sample before a numeric cutoff is used.
+Kaggle does not provide row-level labels, so precision and recall cannot be
+calculated for the public or private test partitions.
+
+```{python}
+#| label: calibration-plot
+#| fig-cap: "Calibration on the untouched holdout. Perfect probability calibration would follow the dashed diagonal."
+#| fig-width: 8
+#| fig-height: 5
+observed_fraction, predicted_mean = calibration_curve(
+    y_holdout_array, holdout_probability, n_bins=10, strategy="quantile"
+)
+fig, ax = plt.subplots()
+ax.plot([0, 1], [0, 1], linestyle="--", color="#64748b", label="Perfect calibration")
+ax.plot(predicted_mean, observed_fraction, marker="o", color="#0f766e", linewidth=2, label="Holdout")
+ax.set(xlabel="Mean predicted score", ylabel="Observed payment-difficulty rate", title="Probability calibration is imperfect")
+ax.legend()
+sns.despine()
+plt.show()
+```
+
+# Decision-threshold analysis
+
+## Sourced base-case assumptions
+
+The threshold normalizes economics to a **$10,000, 24-month amortizing personal
+loan**. This makes the logic auditable without implying that every Home Credit
+loan has the same currency, amount, or term.
+
+1. **Borrower rate:** the Federal Reserve's G.19 series reports an **11.90%**
+   finance rate for 24-month personal loans at commercial banks in August 2026
+   ([Federal Reserve/FRED series](https://fred.stlouisfed.org/data/TERMCBPER24NS)).
+2. **Funding cost:** FDIC Statistics at a Glance reported an **8.00% yield on
+   earning assets, 3.38% funding cost, and 4.62% net interest margin** for its
+   consumer-lender group in Q2 2025
+   ([FDIC table](https://www.fdic.gov/quarterly-banking-profile/statistics-glance-industry-pdf-second-quarter-2025.pdf)).
+3. **Recovery:** Banca d'Italia reported a **24% recovery rate for unsecured
+   positions sold in 2022**, implying 76% LGD
+   ([central-bank recovery study](https://www.bancaditalia.it/pubblicazioni/note-stabilita/2023-0035/Note-di-stabilita-finanziaria-e-vigilanza-n-35-ENG.pdf?language_id=1)).
+
+```{python}
+#| label: economic-assumptions
+assumptions = pd.DataFrame(
+    {
+        "Component": [
+            "Principal",
+            "Scheduled monthly payment",
+            "Gross interest over 24 months",
+            "Estimated funding cost",
+            "Good-loan contribution",
+            "Recovery after default",
+            "Loss on a bad loan",
+        ],
+        "Base case": [
+            PRINCIPAL,
+            monthly_payment,
+            gross_interest,
+            funding_cost,
+            GOOD_LOAN_VALUE,
+            PRINCIPAL * RECOVERY_RATE,
+            BAD_LOAN_LOSS,
+        ],
+    }
+)
+display(assumptions.style.hide(axis="index").format({"Base case": "${:,.0f}"}))
+```
+
+The good-loan contribution subtracts the sourced funding rate from scheduled
+interest, but it remains **before servicing, acquisition, tax, capital, and
+compliance costs**. It is a decision-analysis proxy rather than reported
+accounting profit. The recovery benchmark is from a different market and year;
+Home Credit should replace it with product-level recovery data.
+
+## Cutoff calculation and operating result
+
+Approve when the expected value is positive:
+
+> **Expected value = (1 − risk) × good-loan contribution − risk × bad-loan loss**
+
+The break-even risk is therefore:
+
+> **Break-even cutoff = $921 ÷ ($921 + $7,600) = 10.8%.**
+
+```{python}
+#| label: threshold-outcomes
+threshold_outcomes = pd.DataFrame(
+    {
+        "Measure": [
+            "Predicted payment difficulty",
+            "Approved",
+            "Payment difficulties identified",
+            "Flagged cases that had difficulty",
+            "Observed difficulty among approved",
+            "Scenario value per 10,000",
+            "Incremental value vs. approve-all",
+        ],
+        "Result": [
+            f"Score ≥ {DECISION_THRESHOLD:.1%}",
+            f"{approval_rate:.1%}",
+            f"{threshold_recall:.1%} recall",
+            f"{threshold_precision:.1%} precision",
+            f"{approved_bad_rate:.1%}",
+            f"${base_result['value_per_10k'] / 1_000_000:.2f}M",
+            f"+${incremental_value / 1_000_000:.2f}M",
+        ],
+    }
+)
+display(threshold_outcomes.style.hide(axis="index"))
+```
+
+This calculation treats scores at or above 10.8% as declined and scores below
+it as approved. That is necessary to evaluate a classification threshold, but
+it is **not the recommended launch policy**. The initial operational use should
+route high-risk cases to controlled review while the lender measures whether
+review changes outcomes and whether the queue is manageable.
+
+## Threshold sensitivity
+
+```{python}
+#| label: threshold-sensitivity
+sensitivity_thresholds = [0.05, 0.075, 0.10, DECISION_THRESHOLD, 0.125, 0.15, 0.20, 0.30]
+sensitivity = pd.DataFrame(
+    [economics_at_threshold(t, GOOD_LOAN_VALUE, BAD_LOAN_LOSS) for t in sensitivity_thresholds]
+)
+sensitivity["increment_vs_approve_all"] = sensitivity["value_per_10k"] - approve_all_value
+display(
+    sensitivity[["threshold", "approval_rate", "precision", "recall", "bad_rate_approved", "increment_vs_approve_all"]]
+    .style.hide(axis="index")
+    .format(
+        {
+            "threshold": "{:.1%}",
+            "approval_rate": "{:.1%}",
+            "precision": "{:.1%}",
+            "recall": "{:.1%}",
+            "bad_rate_approved": "{:.1%}",
+            "increment_vs_approve_all": "${:,.0f}",
+        }
+    )
+)
+```
+
+```{python}
+#| label: threshold-value-plot
+#| fig-cap: "Observed holdout value under the base economics. The peak is broad, so the exact cutoff should not be treated as certain."
+#| fig-width: 9
+#| fig-height: 5
+threshold_grid = np.linspace(0.02, 0.35, 100)
+curve = pd.DataFrame(
+    [economics_at_threshold(t, GOOD_LOAN_VALUE, BAD_LOAN_LOSS) for t in threshold_grid]
+)
+curve["incremental_millions"] = (curve["value_per_10k"] - approve_all_value) / 1_000_000
+fig, ax = plt.subplots()
+ax.plot(curve["threshold"], curve["incremental_millions"], color="#0f766e", linewidth=2.5)
+ax.axvline(DECISION_THRESHOLD, color="#ea580c", linestyle="--", label=f"Base cutoff: {DECISION_THRESHOLD:.1%}")
+ax.set(xlabel="Predicted-risk cutoff", ylabel="Incremental value per 10,000 ($M)", title="Business value is sensitive to the decision cutoff")
+ax.legend()
+sns.despine()
+plt.show()
+```
+
+The financial optimum is conditional on both probability calibration and the
+cost assumptions. The following scenarios deliberately move the contribution
+and LGD; the resulting cutoff ranges from approximately 6% to 20%.
+
+```{python}
+#| label: economic-scenario-sensitivity
+economic_scenarios = [
+    ("Low contribution / base LGD", 500, 0.76),
+    ("Base case", GOOD_LOAN_VALUE, 0.76),
+    ("Gross-interest ceiling / base LGD", gross_interest, 0.76),
+    ("Base contribution / 50% LGD", GOOD_LOAN_VALUE, 0.50),
+    ("Base contribution / 90% LGD", GOOD_LOAN_VALUE, 0.90),
+]
+scenario_rows = []
+for scenario, good_value, lgd in economic_scenarios:
+    bad_loss = PRINCIPAL * lgd
+    cutoff = good_value / (good_value + bad_loss)
+    outcome = economics_at_threshold(cutoff, good_value, bad_loss)
+    scenario_rows.append(
+        {
+            "Scenario": scenario,
+            "Good-loan contribution": good_value,
+            "LGD": lgd,
+            "Cutoff": cutoff,
+            "Approval rate": outcome["approval_rate"],
+            "Recall": outcome["recall"],
+        }
+    )
+scenario_table = pd.DataFrame(scenario_rows)
+display(
+    scenario_table.style.hide(axis="index").format(
+        {
+            "Good-loan contribution": "${:,.0f}",
+            "LGD": "{:.0%}",
+            "Cutoff": "{:.1%}",
+            "Approval rate": "{:.1%}",
+            "Recall": "{:.1%}",
+        }
+    )
+)
+```
+
+# Explainability with SHAP
+
+SHAP decomposes a model score into feature-level contributions. Positive SHAP
+values push the prediction toward payment difficulty; negative values push it
+toward lower predicted risk. This analysis uses exactly **1,000 rows**, as
+required, sampled from the labelled application data. Because the final model
+is linear, `LinearExplainer` provides an efficient, model-consistent
+decomposition. See the [SHAP documentation](https://shap.readthedocs.io/).
+
+```{python}
+#| label: shap-computation
+#| output: false
+shap_sample = X_raw.sample(n=1_000, random_state=RANDOM_SEED)
+application_features = production_model.named_steps["application"].transform(shap_sample)
+selected_features = production_model.named_steps["features"].transform(application_features)
+encoded_sample = production_model.named_steps["encoding"].transform(selected_features)
+encoded_dense = encoded_sample.toarray() if hasattr(encoded_sample, "toarray") else np.asarray(encoded_sample)
+encoded_names = production_model.named_steps["encoding"].get_feature_names_out().tolist()
+
+friendly_names = {
+    "numeric__EXT_SOURCE_3": "External credit score 3",
+    "numeric__external_score_mean": "Average external credit score",
+    "numeric__EXT_SOURCE_2": "External credit score 2",
+    "numeric__FLAG_DOCUMENT_3": "Document 3 provided",
+    "categorical__CODE_GENDER_F": "Gender = female [remove before use]",
+    "numeric__credit_to_goods_price": "Credit requested / goods price",
+    "categorical__NAME_EDUCATION_TYPE_Higher education": "Education = higher [review]",
+    "numeric__AMT_ANNUITY": "Scheduled loan payment",
+    "numeric__EXT_SOURCE_1_missing_flag": "External score 1 missing",
+    "categorical__FONDKAPREMONT_MODE___MISSING__": "Renovation-status field missing",
+    "numeric__annuity_to_credit": "Payment / credit amount",
+    "categorical__NAME_FAMILY_STATUS_Married": "Marital status = married [review]",
+    "numeric__EXT_SOURCE_1": "External credit score 1",
+}
+plot_feature_names = [
+    friendly_names.get(name, name.replace("numeric__", "").replace("categorical__", "").replace("_", " "))
+    for name in encoded_names
+]
+
+background = shap.sample(encoded_dense, 200, random_state=RANDOM_SEED)
+masker = shap.maskers.Independent(background, max_samples=200)
+explainer = shap.LinearExplainer(production_model.named_steps["model"], masker)
+shap_explanation = explainer(encoded_dense)
+shap_explanation.feature_names = plot_feature_names
+
+shap_importance = pd.DataFrame(
+    {
+        "Encoded feature": encoded_names,
+        "Business label": plot_feature_names,
+        "Mean absolute SHAP": np.abs(shap_explanation.values).mean(axis=0),
+        "Coefficient": production_model.named_steps["model"].coef_[0],
+    }
+).sort_values("Mean absolute SHAP", ascending=False)
+```
+
+```{python}
+#| label: shap-summary
+#| fig-cap: "SHAP summary for a 1,000-row sample. Color shows the feature value; horizontal position shows whether the value pushed predicted risk up or down."
+#| fig-width: 10
+#| fig-height: 7
+shap.plots.beeswarm(shap_explanation, max_display=12, show=False, plot_size=(10, 7))
+plt.title("External scores dominate, but protected and proxy features also matter", pad=16)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: top-shap-table
+top_shap = shap_importance.head(12)[["Business label", "Mean absolute SHAP"]].copy()
+display(top_shap.style.hide(axis="index").format({"Mean absolute SHAP": "{:.3f}"}))
+```
+
+The external score fields are the largest source of model separation. Lower
+external scores generally increase predicted risk. However, their provenance
+and exact meaning are not documented beyond “normalized score from external
+data source,” so they are not yet suitable for customer-facing explanations.
+
+Two findings are deployment blockers:
+
+- **Gender is influential.** A protected characteristic should not be used as
+  an underwriting reason. It should be removed, followed by retraining and
+  revalidation.
+- **Several document, education, marital-status, and housing-missingness
+  fields matter.** Their semantics, necessity, stability, and proxy risk must
+  be reviewed before they affect a decision.
+
+SHAP explains the model's mathematical behavior; it does not prove that a
+feature causes repayment difficulty or that using it is lawful, fair, or
+operationally appropriate.
+
+# Adverse-action mapping
+
+The CFPB states that adverse-action reasons must be **specific, accurate, and
+actually reflect the factors considered**; a lender cannot select merely the
+closest generic checklist reason
+([CFPB Circular 2022-03](https://www.consumerfinance.gov/compliance/circulars/circular-2022-03-adverse-action-notification-requirements-in-connection-with-credit-decisions-based-on-complex-algorithms/)).
+The table below is therefore a mapping proposal, not a compliance-approved
+notice library.
+
+| Model feature or family | High-risk pattern | Candidate plain-language reason | Deployment disposition |
+|---|---|---|---|
+| `EXT_SOURCE_1/2/3`, external-score mean | Lower normalized external score | “External credit information indicated elevated repayment risk.” | Use only after source owners validate meaning and supply compliant reason codes. |
+| `EXT_SOURCE_1_missing_flag` | External score unavailable | “Insufficient external credit information was available.” | Verify that absence is not caused by protected status or thin-file exclusion. |
+| `credit_to_goods_price` | Requested credit is high relative to purchase price | “The requested loan amount was high relative to the purchase price.” | Potentially usable after policy and data-quality validation. |
+| `AMT_ANNUITY` and payment ratios | Higher scheduled payment or payment burden | “The scheduled payment was high relative to the application information provided.” | Prefer a verified payment-to-income reason with disclosed calculation. |
+| `FLAG_DOCUMENT_3` | Document flag contributes to risk | No compliant reason yet. | Decode “document 3,” establish business necessity, or remove. |
+| `CODE_GENDER` | Sex changes model score | **Never use as an adverse-action reason.** | Remove before deployment; U.S. fair-lending review required. |
+| `NAME_EDUCATION_TYPE` | Education category changes model score | No recommended denial reason. | Review for business necessity and proxy risk; likely exclude. |
+| Housing/renovation missingness | Missing property fields change score | No recommended denial reason. | Investigate structural missingness and proxy risk; likely exclude. |
+
+The [CFPB explains](https://www.consumerfinance.gov/consumer-tools/credit-reports-and-scores/credit-discrimination-is-illegal/)
+that U.S. lenders may not discriminate on protected bases including sex. This
+model card is not legal advice; a lender must involve qualified counsel and
+compliance staff.
+
+# Fairness analysis
+
+Fairness is evaluated on the untouched holdout at the 10.8% provisional
+cutoff. “Approval” means a score below the cutoff in this diagnostic—not an
+actual lending decision. Group size and observed outcome rate are shown so
+that raw differences are not interpreted without context.
+
+```{python}
+#| label: fairness-tables
+fairness_frame = X_holdout[["SK_ID_CURR", "CODE_GENDER", "NAME_EDUCATION_TYPE"]].copy()
+score_lookup = holdout_scores.set_index("SK_ID_CURR")
+fairness_frame["predicted_probability"] = fairness_frame["SK_ID_CURR"].map(score_lookup["predicted_probability"])
+fairness_frame["TARGET"] = fairness_frame["SK_ID_CURR"].map(score_lookup["TARGET"])
+fairness_frame["approved"] = fairness_frame["predicted_probability"] < DECISION_THRESHOLD
+
+
+def group_fairness(column: str) -> pd.DataFrame:
+    grouped = (
+        fairness_frame.groupby(column, dropna=False)
+        .agg(
+            Applications=("approved", "size"),
+            **{
+                "Approval rate": ("approved", "mean"),
+                "Observed difficulty rate": ("TARGET", "mean"),
+                "Mean model score": ("predicted_probability", "mean"),
+            },
+        )
+        .reset_index()
+        .rename(columns={column: "Group"})
+    )
+    reference = grouped.loc[grouped["Approval rate"].idxmax(), "Approval rate"]
+    grouped["Difference from highest"] = grouped["Approval rate"] - reference
+    grouped["Approval-rate ratio"] = grouped["Approval rate"] / reference
+    return grouped
+
+
+gender_fairness = group_fairness("CODE_GENDER")
+education_fairness = group_fairness("NAME_EDUCATION_TYPE")
+
+display(Markdown("### Approval rates by gender"))
+display(
+    gender_fairness.style.hide(axis="index").format(
+        {
+            "Approval rate": "{:.1%}",
+            "Observed difficulty rate": "{:.1%}",
+            "Mean model score": "{:.1%}",
+            "Difference from highest": "{:+.1%}",
+            "Approval-rate ratio": "{:.3f}",
+        }
+    )
+)
+
+display(Markdown("### Approval rates by education"))
+display(
+    education_fairness.style.hide(axis="index").format(
+        {
+            "Approval rate": "{:.1%}",
+            "Observed difficulty rate": "{:.1%}",
+            "Mean model score": "{:.1%}",
+            "Difference from highest": "{:+.1%}",
+            "Approval-rate ratio": "{:.3f}",
+        }
+    )
+)
+```
+
+```{python}
+#| label: fairness-plot
+#| fig-cap: "Approval-rate differences at the provisional cutoff. The two-record XNA gender category is omitted from the chart because it is too small to interpret."
+#| fig-width: 10
+#| fig-height: 6
+gender_plot = gender_fairness[gender_fairness["Applications"] >= 100].assign(Attribute="Gender")
+education_plot = education_fairness[education_fairness["Applications"] >= 100].assign(Attribute="Education")
+plot_data = pd.concat([gender_plot, education_plot], ignore_index=True)
+fig, ax = plt.subplots()
+sns.barplot(data=plot_data, y="Group", x="Approval rate", hue="Attribute", ax=ax, palette=["#0f766e", "#2563eb"])
+ax.axvline(approval_rate, color="#ea580c", linestyle="--", label="Overall")
+ax.xaxis.set_major_formatter(lambda x, pos: f"{x:.0%}")
+ax.set(xlabel="Approval rate", ylabel="", title="Approval rates differ materially across evaluated groups")
+ax.legend(title="")
+sns.despine()
+plt.tight_layout()
+plt.show()
+```
+
+Women have an 81.0% diagnostic approval rate versus 66.8% for men, a gap of
+14.2 percentage points. Applicants with higher education have an 87.7% rate;
+the lower-secondary group has 67.7%, a gap of 20.0 points. The “academic
+degree” group has only 41 observations, so its estimate is unstable. The XNA
+gender category contains only two records and is not interpretable.
+
+Different observed outcome rates help explain why a risk model may produce
+different approval rates, but they do not establish that the model is fair or
+that the inputs are appropriate. The direct use of gender, the influence of
+education, and the size of these gaps require remediation. Approval-rate ratios
+are screening diagnostics, not legal conclusions.
+
+# Limitations and risks
+
+| Risk | Why it matters | Required mitigation |
+|---|---|---|
+| Label mismatch | `TARGET=1` is payment difficulty, not necessarily complete default or realized loss. | Define the production outcome and rebuild economics using actual loss data. |
+| Calibration | AUC can be strong while probabilities are inaccurate; the threshold assumes calibrated risk. | Calibrate on a recent out-of-time sample and monitor reliability by score band. |
+| Protected and proxy variables | Gender directly affects the score; education, marital status, geography, and housing may proxy protected status. | Remove prohibited fields, justify remaining inputs, retrain, and repeat subgroup/intersectional tests. |
+| Solver convergence | The saved model reached `max_iter=200`. | Refit to convergence and confirm stable coefficients, AUC, calibration, and SHAP rankings. |
+| External-score opacity | Source definitions, coverage, and permissible-use documentation are unavailable. | Obtain provenance, data contracts, quality monitoring, and provider reason codes. |
+| Missing credit history | Thin-file applicants may have missing external scores and could be penalized for lack of data rather than inability to repay. | Test thin-file performance separately and create a manual-review or alternative-data path. |
+| Missing supplementary history | Bureau, prior applications, installments, POS cash, and credit-card history were unavailable in this repository snapshot. | Add timing-safe aggregates and compare performance and fairness. |
+| Validation design | Random stratification does not test future economic or policy drift. | Use out-of-time and out-of-geography validation before launch. |
+| Financial assumptions | Rate, funding, recovery, term, and principal are external benchmarks, not Home Credit unit economics. | Replace every assumption with product-level contribution, LGD, and operational cost. |
+| Adverse-action readiness | SHAP labels are not automatically compliant denial reasons. | Validate exact principal reasons, wording, ordering, and reproducibility with counsel. |
+| Selective labels | Outcomes exist for historical applicants who received credit, not all rejected applicants. | Assess reject inference risk and test carefully in shadow mode. |
+
+# Deployment and monitoring plan
+
+1. **Remediate the model.** Remove gender and other unapproved fields; refit to
+   convergence; document external-score provenance; calibrate on out-of-time
+   data; and regenerate this card.
+2. **Run shadow mode.** Score applications without changing decisions. Compare
+   scores, approval outcomes, payment performance, and operational queue size.
+3. **Pilot decision support.** Route a limited, policy-approved risk band for
+   enhanced review while retaining a random control group. Do not automatically
+   decline on this score.
+4. **Scale or stop.** Expand only if incremental value, calibration, fairness,
+   customer outcomes, review capacity, and legal requirements pass predefined
+   gates.
+
+Monitor monthly:
+
+- **Predictive:** AUC, precision, recall, calibration, Brier score, and score-band outcomes;
+- **Business:** approval rate, default/loss rate, contribution, review cost, turnaround time, and abandonment;
+- **Fairness:** approval and error rates by monitored groups and intersections, with sample-size controls;
+- **Data:** missingness, category shifts, external-score coverage, and feature/score drift; and
+- **Operations:** adverse-action reason stability, overrides, complaints, and reviewer consistency.
+
+Rollback or suspend use after material calibration drift, unexplained subgroup
+disparity, degraded economics, data-quality failure, or inability to provide
+accurate adverse-action reasons.
+
+# Conclusion
+
+The model is a useful research prototype with credible ranking performance,
+but it is **not ready to make lending decisions**. Its strongest near-term use
+is as a controlled challenger that helps the business learn where additional
+review may add value. Deployment requires protected-feature removal, converged
+retraining, probability calibration, verified reason codes, time-based
+validation, and a fairness review using the lender's actual applicant and loss
+data.
+
+## Documentation sources {.unnumbered}
+
+- Mitchell et al. (2019), [Model Cards for Model Reporting](https://arxiv.org/abs/1810.03993).
+- Hugging Face, [Model Card Guidebook](https://huggingface.co/docs/hub/en/model-card-guidebook).
+- Google, [Gemma model card](https://ai.google.dev/gemma/docs/core/model_card), reviewed as an example of structured disclosure.
+- Federal Reserve/FRED, [24-month personal-loan finance rate](https://fred.stlouisfed.org/data/TERMCBPER24NS).
+- FDIC, [Statistics at a Glance, Q2 2025](https://www.fdic.gov/quarterly-banking-profile/statistics-glance-industry-pdf-second-quarter-2025.pdf).
+- Banca d'Italia, [Bad loan recovery rates in 2022](https://www.bancaditalia.it/pubblicazioni/note-stabilita/2023-0035/Note-di-stabilita-finanziaria-e-vigilanza-n-35-ENG.pdf?language_id=1).
+- CFPB, [adverse-action requirements for complex algorithms](https://www.consumerfinance.gov/compliance/circulars/circular-2022-03-adverse-action-notification-requirements-in-connection-with-credit-decisions-based-on-complex-algorithms/).
+- CFPB, [credit discrimination is illegal](https://www.consumerfinance.gov/consumer-tools/credit-reports-and-scores/credit-discrimination-is-illegal/).
+- SHAP, [documentation](https://shap.readthedocs.io/).
+
+*This model card documents a classroom project. It is not legal, accounting,
+investment, or lending advice.*
