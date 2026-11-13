@@ -74,6 +74,44 @@ approval rates differ materially across gender and education groups.
   and a controlled human-review pilot with calibration, fairness, drift, and
   business-value monitoring.
 
+## Challenges encountered
+
+- **Class imbalance made accuracy misleading.** Only 8.07% of labelled
+  applications had the payment-difficulty outcome, so a majority-class model
+  achieved 91.93% accuracy despite having no ranking ability. This required
+  evaluating candidates primarily with ROC-AUC.
+- **Preprocessing could easily create leakage.** Medians, category support,
+  missingness treatment, and quantile bins had to be learned separately inside
+  each training fold rather than once on the complete dataset.
+- **Model comparison had to fit a laptop-scale runtime.** Exploration used
+  three-fold validation, while randomized tuning used a stratified 5,000-row
+  sample before the finalist was confirmed on the full development data.
+- **Important historical data was unavailable.** The supplementary bureau,
+  prior-application, installment, POS cash, and credit-card tables were not in
+  the project snapshot, limiting the reproducible model to application data.
+- **Prediction quality did not resolve deployment questions.** Translating
+  technical fields into understandable reasons exposed incomplete feature
+  provenance, protected and proxy-variable concerns, subgroup approval gaps,
+  and a logistic solver that reached its iteration limit.
+
+## What I learned
+
+- A model with useful AUC is not automatically ready to make business
+  decisions; calibration, fairness, explainability, legal requirements, and
+  monitoring can change the deployment recommendation.
+- Validation design and leakage prevention can matter as much as choosing a
+  more complex algorithm.
+- Decision thresholds should reflect the relative economics of good and bad
+  lending outcomes rather than defaulting to a probability cutoff of 0.50.
+- SHAP can explain how a model behaves, but technical contributions still need
+  accurate business language and do not automatically become compliant
+  adverse-action reasons.
+- A simpler logistic model can be preferable when it provides competitive
+  performance, faster iteration, and a clearer path to explanation.
+- Responsible deployment is an iterative process: remediate questionable
+  features, validate in shadow mode, pilot with human oversight, and scale only
+  when predictive, financial, operational, and fairness results agree.
+
 The following sections retain the detailed preparation, modeling, Kaggle, and
 model-card documentation required throughout the project.
 
