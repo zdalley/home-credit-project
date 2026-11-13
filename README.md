@@ -1,6 +1,81 @@
-# Home Credit Project
+# Home Credit Default Risk: Business-Ready Machine Learning
 
-Home Credit Project for the UofU MSBA Practice Capstone course.
+This individual MSBA capstone project asks whether application data can help a
+consumer lender identify applicants at greater risk of payment difficulty—while
+supporting responsible access to credit for people who may have limited
+traditional credit histories. I developed a leakage-safe Python pipeline,
+compared several classification approaches, generated a Kaggle submission, and
+documented deployment risks through a business-focused model card.
+
+## Business result
+
+The selected L2-regularized logistic model produced useful risk ranking without
+the operational complexity of a larger ensemble. On an untouched holdout, the
+model achieved **0.7537 ROC-AUC**; the submitted model earned **0.74133 public
+AUC** and **0.73543 private AUC** on Kaggle. The highest-scored 20% of holdout
+applications contained **51.2% of observed payment-difficulty cases**, showing
+that the score can concentrate review effort where it is more likely to add
+value.
+
+| Portfolio result | Outcome |
+|---|---:|
+| Labelled applications | 307,511 |
+| Payment-difficulty prevalence | 8.07% |
+| Final model | L2 logistic regression, all engineered application features |
+| Five-fold development CV AUC | 0.7478 ± 0.0043 |
+| Untouched-holdout AUC | 0.7537 |
+| Kaggle public / private AUC | 0.74133 / 0.73543 |
+| Provisional cost-based cutoff | 10.8% predicted risk |
+| Approval rate / recall / precision at cutoff | 76.1% / 56.3% / 19.0% |
+| Illustrative incremental value | $1.67M per 10,000 applications vs. approve-all |
+
+The financial result is a sensitivity-tested scenario based on a standardized
+loan and externally sourced rate, funding, and recovery assumptions—not a
+forecast of Home Credit's accounting profit.
+
+## Recommendation
+
+Use the score as a **review-prioritization tool in a controlled pilot**, not as
+an autonomous approval or denial rule. The current model is a strong research
+prototype, but deployment should wait until protected and high-risk proxy
+features are removed, probabilities are calibrated on recent out-of-time data,
+the logistic solver is refit to convergence, and adverse-action explanations
+and subgroup outcomes pass legal and governance review. This conclusion is
+especially important because gender is an influential input and diagnostic
+approval rates differ materially across gender and education groups.
+
+## Portfolio artifacts
+
+| Deliverable | Purpose | GitHub-viewable version |
+|---|---|---|
+| [Exploratory analysis](notebooks/01_eda.ipynb) | Data quality, imbalance, missingness, segment patterns, and feature-governance findings | Jupyter notebook |
+| [Modeling source](notebooks/02_modeling.qmd) | Benchmarks, candidate comparison, class-imbalance experiment, randomized tuning, holdout evaluation, and Kaggle scoring | [Compiled modeling report](notebooks/02_modeling.pdf) |
+| [Model-card source](notebooks/03_model_card.qmd) | Threshold economics, SHAP explanations, adverse-action mapping, fairness, limitations, and monitoring | [Compiled model card](notebooks/03_model_card.pdf) |
+| [Business problem statement](docs/Business%20Problem%20Statement.pdf) | Business context, success criteria, risks, and anticipated value | PDF |
+| [Reusable preparation pipeline](src/application_preparation.py) | Training-fitted cleaning and engineered features used inside validation folds | Python source |
+
+## Interview talking points
+
+- **Leakage prevention:** preprocessing statistics, category support, and bin
+  edges are learned inside each training fold rather than on the full dataset.
+- **Imbalanced classification:** model selection uses ROC-AUC rather than
+  accuracy; the majority-class benchmark reaches 91.93% accuracy but only
+  0.500 AUC.
+- **Efficient experimentation:** logistic regression, random forest, and
+  histogram gradient boosting were compared with shared folds; randomized
+  search used a 5,000-row sample before full-data confirmation.
+- **Performance versus governance:** the final logistic model was competitive,
+  fast, and easier to explain, but predictive value alone did not make every
+  feature appropriate for lending use.
+- **Decision design:** the model card connects probability scores to sourced
+  lending economics, threshold sensitivity, SHAP behavior, plain-language
+  reasons, and subgroup approval rates.
+- **Production judgment:** the recommended path is remediation, shadow mode,
+  and a controlled human-review pilot with calibration, fairness, drift, and
+  business-value monitoring.
+
+The following sections retain the detailed preparation, modeling, Kaggle, and
+model-card documentation required throughout the project.
 
 ## Project layout
 

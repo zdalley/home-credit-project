@@ -1,7 +1,7 @@
 ---
 title: "Home Credit: TARGET Modeling Experiments"
 subtitle: "Leakage-safe model comparison and test scoring"
-author: "MSBA Practice Capstone"
+author: "Zack Dalley"
 format:
   html:
     toc: true
@@ -782,9 +782,9 @@ performance from governance approval.
 |---|---|
 | Validation design | Stratified development/holdout split; 5-fold stratified CV on development data |
 | Metric | ROC-AUC |
-| Chosen algorithm and parameters | _Fill after randomized search_ |
-| Chosen feature set | _Fill after ablation and governance review_ |
-| Holdout AUC | _Fill once; do not tune against it_ |
-| Test-scoring date and artifact paths | _Fill after final refit_ |
-| Kaggle public/private AUC | _Fill after manual submission_ |
+| Chosen algorithm and parameters | Unweighted L2 logistic regression; `C = 0.0020008545549484993`, `solver = "saga"` |
+| Chosen feature set | `all_engineered` application features |
+| Holdout AUC | 0.7537 on the untouched 20% holdout |
+| Test-scoring date and artifact paths | 2026-10-10; local ignored artifacts at `models/home_credit_final_pipeline.joblib` and `data/processed/home_credit_test_predictions.csv` |
+| Kaggle public/private AUC | 0.74133 / 0.73543 |
 | Known limitations | No temporal split/date field; test labels unavailable locally; external-score and proxy-feature governance remains required |
